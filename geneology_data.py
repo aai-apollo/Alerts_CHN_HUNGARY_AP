@@ -18,7 +18,7 @@ from collections import defaultdict
 
 from flask import Blueprint, request, jsonify
 
-import config_hungary
+import config_hungary_uat
 
 genealogy = Blueprint("genealogy", __name__)
 
@@ -143,7 +143,7 @@ def resolve_barcodes(body):
         {"rerun": 0, "last": {"$in": [0, 1]}} if last == 0 else {"last": 1}
     )
 
-    summary_col = config_hungary.data_merged_summary_historical_data
+    summary_col = config_hungary_uat.data_merged_summary_historical_data
 
     mongo_filter = {**yield_filter}
 
@@ -228,7 +228,7 @@ def run_genealogy_query(barcodes):
     total_cap = int(os.getenv("GENEALOGY_TOTAL_CAP", "180"))
 
     # Level 1: seed rows for the finished-tyre barcodes (anchored on g.barcode).
-    anchor = config_hungary.redshift_query(_anchor_query(len(barcodes)), barcodes)
+    anchor = config_hungary_uat.redshift_query(_anchor_query(len(barcodes)), barcodes)
     for r in anchor:
         r["level"] = 1
     all_rows = list(anchor)
@@ -256,7 +256,7 @@ def run_genealogy_query(barcodes):
             f"FROM sc_apollo_mom.t_genealogy_lot_detail AS g "
             f"WHERE g.targetlotid IN ({placeholders})"
         )
-        children = config_hungary.redshift_query(q, lots)
+        children = config_hungary_uat.redshift_query(q, lots)
         for r in children:
             r["level"] = level
             all_rows.append(r)
@@ -305,7 +305,7 @@ def _load_equip_master():
         return _EQUIP_MASTER
     master = {}
     try:
-        for d in config_hungary.equipment_master.find(
+        for d in config_hungary_uat.equipment_master.find(
             {}, {"_id": 0, "sapworkcenter": 1, "division": 1,
                  "workcentersubgroup": 1, "machinetype": 1, "workgroup": 1}
         ):
@@ -530,7 +530,7 @@ def _fetch_barcode_lineage_docs(barcodes):
     if not barcodes:
         return {}
 
-    summary_col = config_hungary.data_merged_summary_historical_data
+    summary_col = config_hungary_uat.data_merged_summary_historical_data
     projection = {
         "_id": 0, "barcode": 1, "sku": 1, "gt_code": 1, "barcode_tbm": 1,
         "ptb_id": 1, "cur_id": 1, "cur_mouldid": 1, "uf_id": 1,
@@ -751,7 +751,7 @@ def get_genealogy_tree():
     # Runs when a TBM node is expanded (deep=true + its traceBarcode). Returns
     # only the trace children (Component -> Mixer -> Raw Material) to graft
     # under that TBM node.
-    deep = bool(body.get("deep")) and config_hungary.redshift_configured()
+    deep = bool(body.get("deep")) and config_hungary_uat.redshift_configured()
     if deep:
         one = _to_list(body.get("barcode") or body.get("barcodes")) or barcodes[:1]
         one = [str(b).strip() for b in one][:1]
@@ -777,7 +777,7 @@ def get_genealogy_tree():
     # lineage (Component -> Mixer -> Raw Material) under each TBM node using a
     # representative barcode. The Redshift walk is expensive, so only the first
     # TBM leaf is traced up front; the rest load lazily (deep mode) on expand.
-    redshift = config_hungary.redshift_configured()
+    redshift = config_hungary_uat.redshift_configured()
 
     root, tbm_leaves = build_process_hierarchy(
         barcodes, body.get("gv_code"), body.get("qr_status")
@@ -827,7 +827,7 @@ def get_genealogy_tree():
 # ----------------------------------------------------------------------------
 # Self-contained job that reads the genealogy / digital-thread data from
 # Redshift and stores one document per finished-tyre barcode into MongoDB.
-# It does NOT use config_hungary (which only exposes Mongo collections, not a
+# It does NOT use config_hungary_uat (which only exposes Mongo collections, not a
 # Redshift connection) and does NOT touch the Flask Blueprint above — run it
 # directly:  python data_genealogy.py
 #
@@ -853,8 +853,8 @@ REDSHIFT_USER = "usr_digital_twin_readonly"
 REDSHIFT_PASSWORD = "UXY0%BSJa9dD#vP"
 
 # ── MongoDB target ──────────────────────────────────────────────────────────
-# MongoDB connection string is read from config_hungary.py.
-GENEOLOGY_MONGO_URI = config_hungary.MONGO_URI
+# MongoDB connection string is read from config_hungary_uat.py.
+GENEOLOGY_MONGO_URI = config_hungary_uat.MONGO_URI
 GENEOLOGY_DB_NAME = "TUB_CIMCORP_VISUAL_merged_cleaned_data_historical_data"
 GENEOLOGY_COLLECTION_NAME = "data_geneolgys"
 # Per-barcode tracking output (first-level components + machine arrays).
@@ -883,8 +883,37 @@ TRACKING_COLLECTION_NAME = "data_merged_tbm_curing_scrap_data"
 # adjust the host clock or convert here — the window string is passed straight
 # into the t_zf_test_completed."timestamp" filter.
 _UFM_NOW = _dt.datetime.now()
-UFM_END = _UFM_NOW.strftime("%Y-%m-%d %H:%M:%S")
-UFM_START = (_UFM_NOW - _dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+
+# ── PRODUCTION-DAY WINDOW (06:00 -> 06:00), 24h back-track ──────────────────
+# A production day runs from 06:00 AM to the next day 06:00 AM. We always
+# normalise the window to these 06:00 boundaries (never "now" wall-clock
+# time), and back-track 24h so the PREVIOUS production day is re-processed
+# together with the current one.
+#
+# Rule: find the 06:00 anchor of the CURRENT production day, then back-track
+# one more day for the start.
+#   * If now >= 06:00  -> today's 06:00 is the current-day start.
+#   * If now  < 06:00  -> we are still inside the previous production day,
+#                         so yesterday's 06:00 is the current-day start.
+#
+# Example (run at 21-10 20:08):
+#   current-day anchor = 21-10 06:00
+#   UFM_START = 20-10 06:00   (back-track 24h -> previous production day)
+#   UFM_END   = 22-10 06:00   (current-day anchor + 24h -> next morning)
+# _split_day_windows then yields TWO 06:00->06:00 day documents:
+#   [20-10 06:00, 21-10 06:00)  and  [21-10 06:00, 22-10 06:00)
+_SIX_AM = _dt.time(hour=6, minute=0, second=0)
+_today_six = _UFM_NOW.replace(hour=6, minute=0, second=0, microsecond=0)
+# Anchor = 06:00 of the current production day.
+_current_day_anchor = _today_six if _UFM_NOW.time() >= _SIX_AM \
+    else (_today_six - _dt.timedelta(days=1))
+
+# Back-track 24h for the start; end is the next-morning 06:00.
+_ufm_start_dt = _current_day_anchor - _dt.timedelta(days=1)
+_ufm_end_dt = _current_day_anchor + _dt.timedelta(days=1)
+
+UFM_START = _ufm_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+UFM_END = _ufm_end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
 # ── Cronjob END ──────────────────────────────────────────────────────
 
@@ -1691,17 +1720,36 @@ def _parse_dt(value):
         return None
 
 
+def _production_day_anchor(dt):
+    """
+    Snap a datetime DOWN to its production-day 06:00 anchor.
+
+    A production day runs 06:00 -> next-day 06:00, so any timestamp at or
+    after 06:00 belongs to THAT day's 06:00; a timestamp before 06:00 still
+    belongs to the PREVIOUS day's 06:00.
+        20-10 13:42  -> 20-10 06:00
+        21-10 02:15  -> 20-10 06:00
+        21-10 06:00  -> 21-10 06:00
+    """
+    six = dt.replace(hour=6, minute=0, second=0, microsecond=0)
+    if dt.time() >= _dt.time(hour=6, minute=0, second=0):
+        return six
+    return six - _dt.timedelta(days=1)
+
+
 def _split_day_windows(start, end):
     """
     Split an overall [start, end) range into consecutive 24h "production day"
     windows that each run from one 06:00 to the next 06:00.
 
-    The window boundaries step by exactly 24h starting at `start`:
-        13-10 06:00 .. 15-10 06:00  ->  [13-10 06:00, 14-10 06:00),
-                                         [14-10 06:00, 15-10 06:00)
-    A sub-day run (e.g. one hour) still yields ONE full window whose end is the
-    next-morning 06:00 (start + 24h):
-        16-10 06:00 .. 16-10 07:00  ->  [16-10 06:00, 17-10 06:00)
+    Both boundaries are ALWAYS snapped to the 06:00 production-day grid, so the
+    stored start_date / end_date are morning 06:00 -> next-morning 06:00 even
+    when the caller passes an arbitrary wall-clock time (e.g. a 20:08 cronjob
+    run or a manual 13:42 start):
+        20-10 13:42 .. 21-10 13:42  ->  [20-10 06:00, 21-10 06:00),
+                                         [21-10 06:00, 22-10 06:00)
+    A sub-day run still yields ONE full 06:00->06:00 window:
+        16-10 06:30 .. 16-10 07:00  ->  [16-10 06:00, 17-10 06:00)
 
     Returns a list of (win_start_str, win_end_str) in 'YYYY-MM-DD HH:MM:SS'.
     Falls back to a single (start, end) window if the dates can't be parsed.
@@ -1712,18 +1760,25 @@ def _split_day_windows(start, end):
         return [(str(start), str(end))]
 
     fmt = "%Y-%m-%d %H:%M:%S"
+
+    # Snap the start DOWN to its 06:00 production-day anchor so every window
+    # begins at 06:00 regardless of the raw start time.
+    cur = _production_day_anchor(sdt)
+
     windows = []
-    cur = sdt
-    # If the range is sub-day (end within 24h of start) OR exactly one day,
-    # this produces exactly one window ending at start + 24h.
+    # Produce a full 06:00->06:00 window for every production day the range
+    # touches. The loop runs while the window START is before the raw end, so
+    # a partial final day still produces its full next-morning window.
     while cur < edt:
         nxt = cur + _dt.timedelta(days=1)
         windows.append((cur.strftime(fmt), nxt.strftime(fmt)))
         cur = nxt
     if not windows:
-        # end <= start (or sub-day) -> single next-morning window.
-        nxt = sdt + _dt.timedelta(days=1)
-        windows.append((sdt.strftime(fmt), nxt.strftime(fmt)))
+        # end <= start (or sub-day) -> single next-morning window from the
+        # snapped 06:00 anchor.
+        anchor = _production_day_anchor(sdt)
+        nxt = anchor + _dt.timedelta(days=1)
+        windows.append((anchor.strftime(fmt), nxt.strftime(fmt)))
     return windows
 
 
