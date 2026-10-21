@@ -1,0 +1,10 @@
+Flask==3.1.2
+pandas 
+redshift-connector 
+pymongo 
+pytz 
+passlib 
+bcrypt
+msal
+sshtunnel
+fpdf
