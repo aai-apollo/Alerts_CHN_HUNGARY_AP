@@ -1,0 +1,11 @@
+Flask 
+pandas 
+redshift-connector 
+pymongo 
+pytz 
+passlib 
+bcrypt
+msal
+sshtunnel
+fpdf
+psycopg2
