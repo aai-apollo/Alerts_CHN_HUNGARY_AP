@@ -1,0 +1,8 @@
+Flask 
+pandas 
+redshift-connector 
+pymongo 
+pytz 
+passlib 
+bcrypt
+pymsteams
