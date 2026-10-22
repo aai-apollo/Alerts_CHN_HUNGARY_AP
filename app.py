@@ -4049,6 +4049,19 @@ def process_tbm_lot_and_alert_data():
     try:
         merge1 = list(merge_collect.find({}))
         merge_df = pd.DataFrame(merge1)
+        # The combined collection is append-only, so the same barcode can appear more
+        # than once across runs: an older copy already carrying a tbm_machine_model_lot_id
+        # and a newer copy with it still null. De-duplicate by barcode here, PREFERRING
+        # the copy that already has a lot id, so already-lotted barcodes are recognised
+        # (and later filtered out) instead of being lotted again with duplicate ids.
+        if not merge_df.empty and "barcode" in merge_df.columns:
+            if "tbm_machine_model_lot_id" not in merge_df.columns:
+                merge_df["tbm_machine_model_lot_id"] = None
+            merge_df["_has_tbm_lot"] = merge_df["tbm_machine_model_lot_id"].notna() & \
+                (merge_df["tbm_machine_model_lot_id"].astype(str) != "nan")
+            merge_df = merge_df.sort_values("_has_tbm_lot", ascending=False) \
+                               .drop_duplicates(subset=["barcode"], keep="first") \
+                               .drop(columns=["_has_tbm_lot"])
         channel_data_tbm = list(channel_collect_tbm.find({"gt_code": {"$in": list(active_gtcodes)}}))
         channel_data_tbm = list(channel_collect_tbm.find({}))
         channel_df = pd.DataFrame(channel_data_tbm)
@@ -4074,8 +4087,15 @@ def process_tbm_lot_and_alert_data():
     if "alert_id_tbm_ufm" not in merge_df.columns:
         merge_df["alert_id_tbm_ufm"] = None
 
-    # Filter data
-    filtered_df = merge_df[merge_df["gt_code"].isin(gt_code_lists) & merge_df["alert_id_tbm_ufm"].isna()]  # Changed from modelno to gt_code
+    # Filter data. Process only barcodes that have NOT already been assigned a TBM
+    # lot id (tbm_machine_model_lot_id is null) AND have no alert id yet — the same
+    # guard UFM uses. The combined collection is append-only, so previously lotted
+    # barcodes remain in it; without this filter they would be re-lotted every run and
+    # produce DUPLICATE tbm_machine_model_lot_id values. With it, each run only lots
+    # NEW barcodes and the lot number keeps incrementing (unique ids).
+    if "tbm_machine_model_lot_id" not in merge_df.columns:
+        merge_df["tbm_machine_model_lot_id"] = None
+    filtered_df = merge_df[merge_df["gt_code"].isin(gt_code_lists) & merge_df["alert_id_tbm_ufm"].isna() & merge_df["tbm_machine_model_lot_id"].isna()]  # Changed from modelno to gt_code
     if not filtered_df.empty:
         merge_df = filtered_df
     else:
@@ -4127,8 +4147,7 @@ def process_tbm_lot_and_alert_data():
             {
                 "$match": {
                     "lot_id": {"$regex": "^TBM_[^_]+_[^_]+_\\d+$"},
-                    "gt_code": {"$in": list(active_gtcodes)},
-                    "tbm": {"$in": list(active_machines)}
+                    "gt_code": {"$in": list(active_gtcodes)}
                 }
             },
             {
@@ -4142,7 +4161,7 @@ def process_tbm_lot_and_alert_data():
                         }
                     },
                     "gt_code": "$gt_code",
-                    "tbm": "$tbm"
+                    "machine": "$machine"
                 }
             },
             {
@@ -4150,14 +4169,20 @@ def process_tbm_lot_and_alert_data():
             },
             {
                 "$group": {
-                    "_id": {"gt_code": "$gt_code", "tbm": "$tbm"},
+                    "_id": {"gt_code": "$gt_code", "machine": "$machine"},
                     "max_lot_number": {"$first": "$lot_number"},
                     "last_lot_id": {"$first": "$lot_id"}
                 }
             }
         ]))
+        # lot_tbm_table stores the machine identifier in a field named "machine"
+        # (NOT "tbm"). Key the dict by (gt_code, str(machine)) so the per-machine
+        # lookup last_lot_dict[(model_number, machine_no)] — where machine_no is a
+        # str — matches. This makes lot numbers CONTINUE incrementing from the
+        # previous run instead of resetting to 1 every run (which regenerated the
+        # same lot_ids and produced duplicate triggering/alert documents).
         last_lot_dict = {
-            (item["_id"]["gt_code"], item["_id"]["tbm"]): {
+            (item["_id"]["gt_code"], str(item["_id"]["machine"])): {
                 "max_lot_number": item["max_lot_number"],
                 "last_lot_id": item["last_lot_id"]
             }
@@ -4169,6 +4194,15 @@ def process_tbm_lot_and_alert_data():
         logging.error(error_message)
         output_messages.append(error_message)
         last_lot_dict = {}
+
+    # Build sets of lot_ids already present in the triggering and alert
+    # collections so we never insert a duplicate document for a lot emitted
+    # in a previous run (mirrors the averages insert guard). The triggering
+    # and alert collections are append-only, so without this a re-generated
+    # lot_id would accumulate duplicate docs across runs.
+    existing_triggering_lot_ids = set(alert_triggering_collect.distinct("lot_id"))
+    existing_alert_lot_ids = set(alert_collect.distinct("lot_id"))
+    existing_deviated_lot_ids = set(alert_triggering_deviated_collect.distinct("lot_id"))
 
     # Prepare merge_df
     merge_df["tbm"] = merge_df["tbm"].astype(str)
@@ -4532,8 +4566,15 @@ def process_tbm_lot_and_alert_data():
                     continue
 
                 for tbm_value, tbm_data in model_data.groupby("tbm"):
-                    # NEW: Check if tbm_value (tbm) is active
-                    # tbm_data = tbm_data[tbm_data["tbm_machine_model_lot_id"].isnull()].copy()
+                    # Only process rows that have NOT already been assigned a lot id.
+                    # Without this filter, when the channel row's gt_code list has more
+                    # than one entry the outer "for gt_code in gt_codes" loop reprocesses
+                    # the same model_data on every iteration (it is filtered by
+                    # model_number, not by gt_code), producing duplicate
+                    # tbm_machine_model_lot_id / tbm_previous_machine_model_lot_id values.
+                    # Curing and UFM already apply this guard; TBM must too.
+                    if "tbm_machine_model_lot_id" in tbm_data.columns:
+                        tbm_data = tbm_data[tbm_data["tbm_machine_model_lot_id"].isnull()].copy()
                     if tbm_data.empty:
                         continue
                     total_tbm_barcodes = len(tbm_data)
@@ -5562,6 +5603,8 @@ def process_tbm_lot_and_alert_data():
                         barcode_counter += batch_size
 
                 for alert_key, alert_obj in alert_map.items():
+                    if alert_obj["lot_id"] in existing_alert_lot_ids:
+                        continue
                     final_alert = {
                         "alert_id_tbm_ufm": alert_obj["alert_id_tbm_ufm"],
                         "gt_code": alert_obj["gt_code"],
@@ -5583,6 +5626,8 @@ def process_tbm_lot_and_alert_data():
                     true_machine_alerts = [ma for ma in alert_obj["machine_alerts"] if ma.get("tbm_shift_occurred", False)]
                     # logging.info("Model %s, Lot %s: %s true machine alerts for triggering" % (alert_obj['gt_code'], alert_obj['lot_id'], len(true_machine_alerts)))
                     if true_machine_alerts:
+                        if alert_obj["lot_id"] in existing_triggering_lot_ids:
+                            continue
                         doc_trigger = {
                             "alert_id_tbm_ufm": alert_obj["alert_id_tbm_ufm"],
                             "gt_code": alert_obj["gt_code"],
@@ -9156,6 +9201,19 @@ def process_tbm_lot_and_alert_data_without_lot_size():
     try:
         merge1 = list(merge_collect.find({}))
         merge_df = pd.DataFrame(merge1)
+        # The combined collection is append-only, so the same barcode can appear more
+        # than once across runs: an older copy already carrying a tbm_machine_model_lot_id
+        # and a newer copy with it still null. De-duplicate by barcode here, PREFERRING
+        # the copy that already has a lot id, so already-lotted barcodes are recognised
+        # (and later filtered out) instead of being lotted again with duplicate ids.
+        if not merge_df.empty and "barcode" in merge_df.columns:
+            if "tbm_machine_model_lot_id" not in merge_df.columns:
+                merge_df["tbm_machine_model_lot_id"] = None
+            merge_df["_has_tbm_lot"] = merge_df["tbm_machine_model_lot_id"].notna() & \
+                (merge_df["tbm_machine_model_lot_id"].astype(str) != "nan")
+            merge_df = merge_df.sort_values("_has_tbm_lot", ascending=False) \
+                               .drop_duplicates(subset=["barcode"], keep="first") \
+                               .drop(columns=["_has_tbm_lot"])
         channel_data_tbm = list(channel_collect_tbm.find({"gt_code": {"$in": list(active_gtcodes)}}))
         channel_data_tbm = list(channel_collect_tbm.find({}))
         channel_df = pd.DataFrame(channel_data_tbm)
@@ -9181,8 +9239,15 @@ def process_tbm_lot_and_alert_data_without_lot_size():
     if "alert_id_tbm_ufm" not in merge_df.columns:
         merge_df["alert_id_tbm_ufm"] = None
 
-    # Filter data
-    filtered_df = merge_df[merge_df["gt_code"].isin(gt_code_lists) & merge_df["alert_id_tbm_ufm"].isna()]  # Changed from modelno to gt_code
+    # Filter data. Process only barcodes that have NOT already been assigned a TBM
+    # lot id (tbm_machine_model_lot_id is null) AND have no alert id yet — the same
+    # guard UFM uses. The combined collection is append-only, so previously lotted
+    # barcodes remain in it; without this filter they would be re-lotted every run and
+    # produce DUPLICATE tbm_machine_model_lot_id values. With it, each run only lots
+    # NEW barcodes and the lot number keeps incrementing (unique ids).
+    if "tbm_machine_model_lot_id" not in merge_df.columns:
+        merge_df["tbm_machine_model_lot_id"] = None
+    filtered_df = merge_df[merge_df["gt_code"].isin(gt_code_lists) & merge_df["alert_id_tbm_ufm"].isna() & merge_df["tbm_machine_model_lot_id"].isna()]  # Changed from modelno to gt_code
     if not filtered_df.empty:
         merge_df = filtered_df
     else:
@@ -9234,8 +9299,7 @@ def process_tbm_lot_and_alert_data_without_lot_size():
             {
                 "$match": {
                     "lot_id": {"$regex": "^TBM_[^_]+_[^_]+_\\d+$"},
-                    "gt_code": {"$in": list(active_gtcodes)},
-                    "tbm": {"$in": list(active_machines)}
+                    "gt_code": {"$in": list(active_gtcodes)}
                 }
             },
             {
@@ -9249,7 +9313,7 @@ def process_tbm_lot_and_alert_data_without_lot_size():
                         }
                     },
                     "gt_code": "$gt_code",
-                    "tbm": "$tbm"
+                    "machine": "$machine"
                 }
             },
             {
@@ -9257,14 +9321,20 @@ def process_tbm_lot_and_alert_data_without_lot_size():
             },
             {
                 "$group": {
-                    "_id": {"gt_code": "$gt_code", "tbm": "$tbm"},
+                    "_id": {"gt_code": "$gt_code", "machine": "$machine"},
                     "max_lot_number": {"$first": "$lot_number"},
                     "last_lot_id": {"$first": "$lot_id"}
                 }
             }
         ]))
+        # lot_tbm_table stores the machine identifier in a field named "machine"
+        # (NOT "tbm"). Key the dict by (gt_code, str(machine)) so the per-machine
+        # lookup last_lot_dict[(model_number, machine_no)] — where machine_no is a
+        # str — matches. This makes lot numbers CONTINUE incrementing from the
+        # previous run instead of resetting to 1 every run (which regenerated the
+        # same lot_ids and produced duplicate triggering/alert documents).
         last_lot_dict = {
-            (item["_id"]["gt_code"], item["_id"]["tbm"]): {
+            (item["_id"]["gt_code"], str(item["_id"]["machine"])): {
                 "max_lot_number": item["max_lot_number"],
                 "last_lot_id": item["last_lot_id"]
             }
@@ -9275,6 +9345,15 @@ def process_tbm_lot_and_alert_data_without_lot_size():
         logging.error(error_message)
         output_messages.append(error_message)
         last_lot_dict = {}
+
+    # Build sets of lot_ids already present in the triggering and alert
+    # collections so we never insert a duplicate document for a lot emitted
+    # in a previous run (mirrors the averages insert guard). The triggering
+    # and alert collections are append-only, so without this a re-generated
+    # lot_id would accumulate duplicate docs across runs.
+    existing_triggering_lot_ids = set(alert_triggering_collect.distinct("lot_id"))
+    existing_alert_lot_ids = set(alert_collect.distinct("lot_id"))
+    existing_deviated_lot_ids = set(alert_triggering_deviated_collect.distinct("lot_id"))
 
     # Prepare merge_df
     merge_df["tbm"] = merge_df["tbm"].astype(str)
@@ -10630,6 +10709,8 @@ def process_tbm_lot_and_alert_data_without_lot_size():
                         barcode_counter += batch_size
 
                 for alert_key, alert_obj in alert_map.items():
+                    if alert_obj["lot_id"] in existing_alert_lot_ids:
+                        continue
                     final_alert = {
                         "alert_id_tbm_ufm": alert_obj["alert_id_tbm_ufm"],
                         "gt_code": alert_obj["gt_code"],
@@ -10651,6 +10732,8 @@ def process_tbm_lot_and_alert_data_without_lot_size():
                     true_machine_alerts = [ma for ma in alert_obj["machine_alerts"] if ma.get("tbm_shift_occurred", False)]
                     # logging.info("Model %s, Lot %s: %s true machine alerts for triggering" % (alert_obj['gt_code'], alert_obj['lot_id'], len(true_machine_alerts)))
                     if true_machine_alerts:
+                        if alert_obj["lot_id"] in existing_triggering_lot_ids:
+                            continue
                         doc_trigger = {
                             "alert_id_tbm_ufm": alert_obj["alert_id_tbm_ufm"],
                             "gt_code": alert_obj["gt_code"],
