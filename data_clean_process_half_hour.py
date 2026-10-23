@@ -50,42 +50,138 @@ from config import (
 
 
 # # =============================================================================
-# # NO-SAVE PATCH — writes to these DBs are silently suppressed.
-# # Reads return empty results so all logic continues unchanged.
-# # =============================================================================
-# _BLOCKED_DBS = {CIMCORP_DB_new, TUB_DB_new, Data_Clean_CIMCORP_HOME, Data_Clean_TUB_HOME}
+# =============================================================================
+# NO-INSERT PATCH — suppresses WRITES to specific databases only.
+# Processing (cleaning, combining, merging) is completely unchanged:
+#   * CIMCORP_HOME / TUB_HOME
+#                        → in-memory cache: writes are cached, reads come from
+#                          the cache so the insert→clean→combine round-trip
+#                          works without persisting raw data to MongoDB.
+#   * Data_Clean_TUB_HOME /
+#     Data_Clean_CIMCORP_HOME
+#                        → writes discarded (never read back inside this file).
+# All other databases (all_combined_data_home,
+# TUB_CIMCORP_merged_cleaned_data_home, INVALID_ROWS,
+# file_tracking, alert_mail_db, etc.) are NOT blocked and persist normally.
+# =============================================================================
+import copy as _copy
 
-# class _NoOpCollection:
-#     """Drop-in replacement for a PyMongo collection that discards all writes."""
-#     def insert_one(self, *a, **kw):        return type('R', (), {'inserted_id': None})()
-#     def insert_many(self, *a, **kw):       return type('R', (), {'inserted_ids': []})()
-#     def bulk_write(self, *a, **kw):        return type('R', (), {'inserted_count': 0, 'modified_count': 0, 'upserted_count': 0})()
-#     def update_one(self, *a, **kw):        return type('R', (), {'modified_count': 0})()
-#     def update_many(self, *a, **kw):       return type('R', (), {'modified_count': 0})()
-#     def delete_one(self, *a, **kw):        return type('R', (), {'deleted_count': 0})()
-#     def delete_many(self, *a, **kw):       return type('R', (), {'deleted_count': 0})()
-#     def find_one(self, *a, **kw):          return None
-#     def find(self, *a, **kw):              return iter([])
-#     def aggregate(self, *a, **kw):         return iter([])
-#     def distinct(self, *a, **kw):          return []
-#     def count_documents(self, *a, **kw):   return 0
-#     def create_index(self, *a, **kw):      return None
-#     def __getattr__(self, name):           return lambda *a, **kw: None
+_CACHED_DBS_HOME    = {CIMCORP_DB_new, TUB_DB_new}
+_SUPPRESS_WRITE_HOME = {Data_Clean_TUB_HOME, Data_Clean_CIMCORP_HOME}
 
-# class _NoOpDB:
-#     """Drop-in replacement for a PyMongo database that returns NoOpCollections."""
-#     def __getitem__(self, name):           return _NoOpCollection()
-#     def __getattr__(self, name):           return _NoOpCollection()
+_rn = lambda **kw: type('R', (), kw)()
 
-# _original_getitem = client.__class__.__getitem__
+def _to_native_home(v):
+    """Convert numpy / pandas types to plain Python (mirrors MongoDB BSON round-trip)."""
+    if v is None:           return None
+    if v is pd.NaT:         return None
+    if isinstance(v, float) and v != v: return None   # NaN
+    if isinstance(v, np.integer):   return int(v)
+    if isinstance(v, np.floating):  return None if np.isnan(v) else float(v)
+    if isinstance(v, np.bool_):     return bool(v)
+    if isinstance(v, np.ndarray):   return v.tolist()
+    if isinstance(v, pd.Timestamp): return None if pd.isna(v) else v.to_pydatetime()
+    if isinstance(v, datetime):     return v
+    return v
 
-# def _patched_getitem(self, db_name):
-#     if db_name in _BLOCKED_DBS:
-#         return _NoOpDB()
-#     return _original_getitem(self, db_name)
 
-# client.__class__.__getitem__ = _patched_getitem
-# # =============================================================================
+class _CachedCollectionHome:
+    """In-memory collection: caches writes, serves reads from the cache."""
+    def __init__(self, name):
+        self.name = name
+        self._records = []
+    def insert_many(self, records, **kw):
+        normalized = [{k: _to_native_home(v) for k, v in r.items()} for r in list(records)]
+        self._records.extend(_copy.deepcopy(normalized))
+        return _rn(inserted_ids=[])
+    def insert_one(self, record, **kw):
+        self._records.append(_copy.deepcopy({k: _to_native_home(v) for k, v in record.items()}))
+        return _rn(inserted_id=None)
+    def find(self, *a, **kw):
+        return iter(_copy.deepcopy(r) for r in self._records)
+    def find_one(self, *a, **kw):
+        return _copy.deepcopy(self._records[0]) if self._records else None
+    def count_documents(self, *a, **kw): return len(self._records)
+    def delete_many(self, *a, **kw):
+        n = len(self._records); self._records.clear(); return _rn(deleted_count=n)
+    def delete_one(self, *a, **kw):
+        if self._records: self._records.pop(0); return _rn(deleted_count=1)
+        return _rn(deleted_count=0)
+    def update_one(self, *a, **kw):  return _rn(modified_count=0)
+    def update_many(self, *a, **kw): return _rn(modified_count=0)
+    def bulk_write(self, *a, **kw):
+        return _rn(inserted_count=0, modified_count=0, upserted_count=0)
+    def create_index(self, *a, **kw):    return None
+    def index_information(self, *a, **kw): return {}
+    def aggregate(self, *a, **kw):   return iter([])
+    def distinct(self, *a, **kw):    return []
+    def __getattr__(self, name):     return lambda *a, **kw: None
+
+
+class _CachedDBHome:
+    """Returns _CachedCollectionHome instances (one per collection name)."""
+    def __init__(self):
+        self._collections = {}
+    def __getitem__(self, name):
+        if name not in self._collections:
+            self._collections[name] = _CachedCollectionHome(name)
+        return self._collections[name]
+    def list_collection_names(self, *a, **kw): return list(self._collections.keys())
+    def __getattr__(self, name): return lambda *a, **kw: None
+
+
+class _WriteSuppressCollectionHome:
+    """Reads pass through to the real collection; writes return fake success."""
+    def __init__(self, real_coll):
+        self._real = real_coll
+    def find(self, *a, **kw):            return self._real.find(*a, **kw)
+    def find_one(self, *a, **kw):        return self._real.find_one(*a, **kw)
+    def aggregate(self, *a, **kw):       return self._real.aggregate(*a, **kw)
+    def count_documents(self, *a, **kw): return self._real.count_documents(*a, **kw)
+    def distinct(self, *a, **kw):        return self._real.distinct(*a, **kw)
+    def index_information(self, *a, **kw): return self._real.index_information(*a, **kw)
+    def insert_one(self, *a, **kw):      return _rn(inserted_id=None)
+    def insert_many(self, *a, **kw):     return _rn(inserted_ids=[])
+    def bulk_write(self, *a, **kw):
+        return _rn(inserted_count=0, modified_count=0, upserted_count=0)
+    def update_one(self, *a, **kw):      return _rn(modified_count=0)
+    def update_many(self, *a, **kw):     return _rn(modified_count=0)
+    def delete_one(self, *a, **kw):      return _rn(deleted_count=0)
+    def delete_many(self, *a, **kw):     return _rn(deleted_count=0)
+    def create_index(self, *a, **kw):    return None
+    @property
+    def name(self): return self._real.name
+    def __getattr__(self, name): return getattr(self._real, name)
+
+
+class _WriteSuppressDBHome:
+    """Returns _WriteSuppressCollectionHome wrappers over the real database."""
+    def __init__(self, real_db):
+        self._real = real_db
+    def __getitem__(self, name):
+        return _WriteSuppressCollectionHome(self._real[name])
+    def list_collection_names(self, *a, **kw):
+        return self._real.list_collection_names(*a, **kw)
+    def __getattr__(self, name): return getattr(self._real, name)
+
+
+_cached_dbs_home = {}
+def _get_cached_db_home(db_name):
+    if db_name not in _cached_dbs_home:
+        _cached_dbs_home[db_name] = _CachedDBHome()
+    return _cached_dbs_home[db_name]
+
+_orig_getitem_home = client.__class__.__getitem__
+
+def _patched_getitem_home(self, db_name):
+    if db_name in _CACHED_DBS_HOME:
+        return _get_cached_db_home(db_name)
+    if db_name in _SUPPRESS_WRITE_HOME:
+        return _WriteSuppressDBHome(_orig_getitem_home(self, db_name))
+    return _orig_getitem_home(self, db_name)
+
+client.__class__.__getitem__ = _patched_getitem_home
+# =============================================================================
 
 
 app = Flask(__name__)
@@ -184,7 +280,42 @@ class RedshiftDataConnectorr:
     
 inst = RedshiftDataConnectorr()
 
-################## updated code start 02/12/2025 #######################
+################## Cronjob code START for 30 mins back track #######################
+# local_tz = pytz.timezone("Asia/Kolkata")
+
+# # Current time in IST
+# now = datetime.now(pytz.utc).astimezone(local_tz)
+
+# print("local_tz:", local_tz)
+# print("now:", now)
+
+# # Allowed trigger minutes
+# trigger_minutes = (27, 57)
+# print("trigger_minutes:", trigger_minutes)
+
+# if now.minute not in trigger_minutes:
+#     # Not trigger time → default fallback logic
+#     start_dt = (now - timedelta(hours=1)).replace(minute=8, second=0, microsecond=0)
+#     end_dt = start_dt + timedelta(minutes=60)
+
+# else:
+#     if now.minute == 27:
+#         # Example: at 12:27 → 11:08 to 12:08
+#         end_dt = now.replace(minute=8, second=0, microsecond=0)
+#         start_dt = end_dt - timedelta(hours=1)
+
+#     elif now.minute == 57:
+#         # Example: at 12:57 → 11:38 to 12:38
+#         end_dt = now.replace(minute=38, second=0, microsecond=0)
+#         start_dt = end_dt - timedelta(hours=1)
+################## Cronjob code END for 30 mins back track #######################
+
+
+
+################## Cronjob code START for 8 hours back track #######################
+from datetime import datetime, timedelta
+import pytz
+
 local_tz = pytz.timezone("Asia/Kolkata")
 
 # Current time in IST
@@ -198,22 +329,29 @@ trigger_minutes = (27, 57)
 print("trigger_minutes:", trigger_minutes)
 
 if now.minute not in trigger_minutes:
-    # Not trigger time → default fallback logic
-    start_dt = (now - timedelta(hours=1)).replace(minute=8, second=0, microsecond=0)
-    end_dt = start_dt + timedelta(minutes=60)
+    # Not a trigger time: fallback logic
+    end_dt = (now - timedelta(hours=1)).replace(
+        minute=8, second=0, microsecond=0
+    )
+    start_dt = end_dt - timedelta(hours=8)
 
 else:
     if now.minute == 27:
-        # Example: at 12:27 → 11:08 to 12:08
-        end_dt = now.replace(minute=8, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=1)
+        # Example: at 12:27 PM -> 04:08 AM to 12:08 PM
+        end_dt = now.replace(
+            minute=8, second=0, microsecond=0
+        )
+        start_dt = end_dt - timedelta(hours=8)
 
     elif now.minute == 57:
-        # Example: at 12:57 → 11:38 to 12:38
-        end_dt = now.replace(minute=38, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=1)
-################## updated code end 02/12/2025 #######################
-        
+        # Example: at 12:57 PM -> 04:38 AM to 12:38 PM
+        end_dt = now.replace(
+            minute=38, second=0, microsecond=0
+        )
+        start_dt = end_dt - timedelta(hours=8)
+
+################## Cronjob code END for 8 hours back track #######################
+
 ################## manual running code start ######################        
 # from datetime import datetime
 # import pytz
@@ -223,12 +361,12 @@ else:
 # # -----------------------------------------------------------------------------------
 # # Provide only manual date range (No last-hour fallback)
 # # -----------------------------------------------------------------------------------
-# manual_start_date = '2026-06-01'
-# manual_end_date = '2026-06-08'
+# manual_start_date = '2026-06-02'
+# manual_end_date = '2026-06-02'
 
 # # If you want full-day coverage
 # manual_start_time = '07:00:00'
-# manual_end_time = '23:07:00'
+# manual_end_time = '10:00:00'
 
 # # Combine date + time and convert to timezone-aware datetime
 # start_dt = local_tz.localize(
@@ -630,9 +768,9 @@ def clean_cimcorp_data(df):
     duplicates_df = pd.DataFrame()
     logging.info("clean_cimcorp_data function is just started")
     try:
-        df = df.applymap(str)
+        df = df.map(str)
         df.columns = [re.sub(r'[.\s]+', '_', col.strip()).lower() for col in df.columns]
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
         for col in df.select_dtypes(include=['object']):
             df[col] = df[col].astype(str).str.strip()
         rename_columns_mapping = {
@@ -879,6 +1017,11 @@ def chunked_insert(collection, records, chunk_size=5000):
     return inserted
 
 def process_data_for_api(db_client, source_data, database_name, filename):
+    # Sanitize record dicts so NaT / NaN / numpy types are safe for MongoDB BSON
+    # (these can re-emerge when pandas reconstructs a DataFrame from None values)
+    def _sanitize_records(records):
+        return [{k: _to_native_home(v) for k, v in rec.items()} for rec in records]
+
     output_messages = []
     cleaned_collection_name = None
     invalid_collection_name = None
@@ -894,7 +1037,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             if not invalid_df.empty:
                 invalid_df = invalid_df.drop('_id', axis=1, errors='ignore')
                 invalid_collect = db_client[INVALID_ROWS_DB][invalid_collection_name]
-                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(invalid_df.to_dict("records"))
+                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(_sanitize_records(invalid_df.to_dict("records")))
                 output_messages.append(f"Invalid TUB_HOME data saved to invalid_data_TUB.{invalid_collection_name}")
             else:
                 output_messages.append("No invalid TUB_HOME data to save.")
@@ -909,7 +1052,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
                 delete_result = combined_tub_collection.delete_many({})
                 output_messages.append(f"Deleted {delete_result.deleted_count} existing documents from {COMBINED_Database_new}.{ALL_COMBINED_TUB_COLLECTION_new}")
                 
-                combined_tub_collection.insert_many(cleaned_df.to_dict("records"))
+                combined_tub_collection.insert_many(_sanitize_records(cleaned_df.to_dict("records")))
                 output_messages.append(f"Cleaned TUB_HOME data pushed to {COMBINED_Database_new}.{ALL_COMBINED_TUB_COLLECTION_new}")
             else:
                 output_messages.append("No cleaned TUB_HOME data to push to combined collection")
@@ -922,7 +1065,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             
             if not invalid_barcode_rows.empty:
                 invalid_barcode_rows = invalid_barcode_rows.drop('_id', axis=1, errors='ignore')
-                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(invalid_barcode_rows.to_dict("records"))
+                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(_sanitize_records(invalid_barcode_rows.to_dict("records")))
                 output_messages.append(f"Invalid CIMCORP_HOME data saved to invalid_data_CIMCORP.{invalid_collection_name}")
             else:
                 output_messages.append("No invalid barcode CIMCORP_HOME data to save.")
@@ -930,7 +1073,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             if not duplicates_df.empty:
                 duplicate_collection_name = f"duplicate_CIMCORP_{filename.replace('.csv', '').replace('.xlsx', '')}"
                 duplicates_df = duplicates_df.drop('_id', axis=1, errors='ignore')
-                db_client[INVALID_ROWS_DB][duplicate_collection_name].insert_many(duplicates_df.to_dict("records"))
+                db_client[INVALID_ROWS_DB][duplicate_collection_name].insert_many(_sanitize_records(duplicates_df.to_dict("records")))
                 output_messages.append(f"Duplicate CIMCORP_HOME data saved to {INVALID_ROWS_DB}.{duplicate_collection_name}")
             else:
                 output_messages.append("No duplicate CIMCORP_HOME data to save.")
@@ -945,7 +1088,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
                 delete_result = combined_cimcorp_collection.delete_many({})
                 output_messages.append(f"Deleted {delete_result.deleted_count} existing documents from {COMBINED_Database_new}.{ALL_COMBINED_CIMCORP_COLLECTION_new}")
                 
-                combined_cimcorp_collection.insert_many(cleaned_df.to_dict("records"))
+                combined_cimcorp_collection.insert_many(_sanitize_records(cleaned_df.to_dict("records")))
                 output_messages.append(f"Cleaned CIMCORP_HOME data pushed to {COMBINED_Database_new}.{ALL_COMBINED_CIMCORP_COLLECTION_new}")
             else:
                 output_messages.append("No cleaned CIMCORP_HOME data to push to combined collection")
@@ -956,6 +1099,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
     except Exception as e:
         error_message = f"Error processing data: {e}"
         output_messages.append(error_message)
+        logging.error("process_data_for_api error: %s", e, exc_info=True)
         return output_messages, None, None
     
     logging.info("process_data_for_api function is completed")

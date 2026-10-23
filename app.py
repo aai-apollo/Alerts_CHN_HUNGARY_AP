@@ -119,43 +119,162 @@ from config import (
 
 )
 
-# # =============================================================================
-# # NO-SAVE PATCH — writes to these DBs are silently suppressed.
-# # Reads return empty results so all logic continues unchanged.
-# # =============================================================================
-# _BLOCKED_DBS = {alert_db, alert_db_dashboard, alert_deviated, alert_table, lot_db, average_db, CIMCORP_DB, TUB_DB, Data_Clean_CIMCORP, Data_Clean_TUB}
+# =============================================================================
+# NO-INSERT PATCH — suppresses WRITES to specific databases only.
+# Processing (cleaning, lots, yields, averages, alert-ID logic) is unchanged:
+#   * CIMCORP / TUB            → in-memory cache: writes are cached, reads come
+#                                from the cache (so the clean→combine round-trip
+#                                works without persisting raw data to MongoDB).
+#   * Data_Clean_CIMCORP /
+#     Data_Clean_TUB            → writes discarded (never read back inside app.py).
+#   * alert_db /
+#     alert_db_dashboard /
+#     alert_deviated            → writes discarded (trigger_mail.py reads these in
+#                                a separate process; within app.py they are write-only).
+#   * alert_table               → reads pass through to the REAL MongoDB (so
+#                                last_alert_id lookups work against historical data),
+#                                writes discarded.
+# lot_db, average_db, all_combined_data, TUB_CIMCORP_DB, alert_db_virgin_yield,
+# alert_db_final_yield, etc. are NOT blocked and persist normally.
+# =============================================================================
+import copy as _copy
 
-# class _NoOpCollection:
-#     """Drop-in replacement for a PyMongo collection that discards all writes."""
-#     def insert_one(self, *a, **kw):        return type('R', (), {'inserted_id': None})()
-#     def insert_many(self, *a, **kw):       return type('R', (), {'inserted_ids': []})()
-#     def bulk_write(self, *a, **kw):        return type('R', (), {'inserted_count': 0, 'modified_count': 0, 'upserted_count': 0})()
-#     def update_one(self, *a, **kw):        return type('R', (), {'modified_count': 0})()
-#     def update_many(self, *a, **kw):       return type('R', (), {'modified_count': 0})()
-#     def delete_one(self, *a, **kw):        return type('R', (), {'deleted_count': 0})()
-#     def delete_many(self, *a, **kw):       return type('R', (), {'deleted_count': 0})()
-#     def find_one(self, *a, **kw):          return None
-#     def find(self, *a, **kw):              return iter([])
-#     def aggregate(self, *a, **kw):         return iter([])
-#     def distinct(self, *a, **kw):          return []
-#     def count_documents(self, *a, **kw):   return 0
-#     def create_index(self, *a, **kw):      return None
-#     def __getattr__(self, name):           return lambda *a, **kw: None
+# Databases whose writes are cached in memory (round-trip needed for processing)
+_CACHED_DBS = {CIMCORP_DB, TUB_DB}
 
-# class _NoOpDB:
-#     """Drop-in replacement for a PyMongo database that returns NoOpCollections."""
-#     def __getitem__(self, name):           return _NoOpCollection()
-#     def __getattr__(self, name):           return _NoOpCollection()
+# Databases whose writes are discarded (reads pass through to real MongoDB)
+_SUPPRESS_WRITE_DBS = {
+    Data_Clean_CIMCORP, Data_Clean_TUB,
+    alert_db, alert_db_dashboard, alert_deviated, alert_table,
+}
 
-# _original_getitem = client.__class__.__getitem__
+_r = lambda **kw: type('R', (), kw)()
 
-# def _patched_getitem(self, db_name):
-#     if db_name in _BLOCKED_DBS:
-#         return _NoOpDB()
-#     return _original_getitem(self, db_name)
+def _to_native(v):
+    """Convert numpy / pandas types to native Python (mirrors MongoDB BSON round-trip)."""
+    if v is None:
+        return None
+    if v is pd.NaT:
+        return None
+    if isinstance(v, float) and v != v:          # NaN
+        return None
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        return None if np.isnan(v) else float(v)
+    if isinstance(v, np.bool_):
+        return bool(v)
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, pd.Timestamp):
+        return None if pd.isna(v) else v.to_pydatetime()
+    if isinstance(v, datetime):
+        return v
+    return v
 
-# client.__class__.__getitem__ = _patched_getitem
-# # =============================================================================
+
+class _CachedCollection:
+    """In-memory collection: caches writes, serves reads from the cache."""
+    def __init__(self, name):
+        self.name = name
+        self._records = []
+    def insert_many(self, records, **kw):
+        normalized = [{k: _to_native(v) for k, v in r.items()} for r in list(records)]
+        self._records.extend(_copy.deepcopy(normalized))
+        return _r(inserted_ids=[])
+    def insert_one(self, record, **kw):
+        self._records.append(_copy.deepcopy({k: _to_native(v) for k, v in record.items()}))
+        return _r(inserted_id=None)
+    def find(self, *a, **kw):
+        return iter(_copy.deepcopy(r) for r in self._records)
+    def find_one(self, *a, **kw):
+        return _copy.deepcopy(self._records[0]) if self._records else None
+    def count_documents(self, *a, **kw):
+        return len(self._records)
+    def delete_many(self, *a, **kw):
+        n = len(self._records); self._records.clear()
+        return _r(deleted_count=n)
+    def delete_one(self, *a, **kw):
+        if self._records: self._records.pop(0); return _r(deleted_count=1)
+        return _r(deleted_count=0)
+    def update_one(self, *a, **kw):  return _r(modified_count=0)
+    def update_many(self, *a, **kw): return _r(modified_count=0)
+    def bulk_write(self, *a, **kw):
+        return _r(inserted_count=0, modified_count=0, upserted_count=0)
+    def create_index(self, *a, **kw): return None
+    def index_information(self, *a, **kw): return {}
+    def aggregate(self, *a, **kw):   return iter([])
+    def distinct(self, *a, **kw):    return []
+    def __getattr__(self, name):     return lambda *a, **kw: None
+
+
+class _CachedDB:
+    """Returns _CachedCollection instances (shared per database name)."""
+    def __init__(self):
+        self._collections = {}
+    def __getitem__(self, name):
+        if name not in self._collections:
+            self._collections[name] = _CachedCollection(name)
+        return self._collections[name]
+    def list_collection_names(self, *a, **kw):
+        return list(self._collections.keys())
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
+class _WriteSuppressCollection:
+    """Reads pass through to the real collection; writes return fake success."""
+    def __init__(self, real_coll):
+        self._real = real_coll
+    def find(self, *a, **kw):         return self._real.find(*a, **kw)
+    def find_one(self, *a, **kw):     return self._real.find_one(*a, **kw)
+    def aggregate(self, *a, **kw):    return self._real.aggregate(*a, **kw)
+    def count_documents(self, *a, **kw): return self._real.count_documents(*a, **kw)
+    def distinct(self, *a, **kw):     return self._real.distinct(*a, **kw)
+    def index_information(self, *a, **kw): return self._real.index_information(*a, **kw)
+    def insert_one(self, *a, **kw):  return _r(inserted_id=None)
+    def insert_many(self, *a, **kw): return _r(inserted_ids=[])
+    def bulk_write(self, *a, **kw):
+        return _r(inserted_count=0, modified_count=0, upserted_count=0)
+    def update_one(self, *a, **kw):   return _r(modified_count=0)
+    def update_many(self, *a, **kw): return _r(modified_count=0)
+    def delete_one(self, *a, **kw):  return _r(deleted_count=0)
+    def delete_many(self, *a, **kw): return _r(deleted_count=0)
+    def create_index(self, *a, **kw): return None
+    @property
+    def name(self): return self._real.name
+    def __getattr__(self, name):      return getattr(self._real, name)
+
+
+class _WriteSuppressDB:
+    """Returns _WriteSuppressCollection wrappers over the real database."""
+    def __init__(self, real_db):
+        self._real = real_db
+    def __getitem__(self, name):
+        return _WriteSuppressCollection(self._real[name])
+    def list_collection_names(self, *a, **kw):
+        return self._real.list_collection_names(*a, **kw)
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+_cached_dbs = {}
+def _get_cached_db(db_name):
+    if db_name not in _cached_dbs:
+        _cached_dbs[db_name] = _CachedDB()
+    return _cached_dbs[db_name]
+
+_original_getitem = client.__class__.__getitem__
+
+def _patched_getitem(self, db_name):
+    if db_name in _CACHED_DBS:
+        return _get_cached_db(db_name)
+    if db_name in _SUPPRESS_WRITE_DBS:
+        return _WriteSuppressDB(_original_getitem(self, db_name))
+    return _original_getitem(self, db_name)
+
+client.__class__.__getitem__ = _patched_getitem
+# =============================================================================
 
 app = Flask(__name__)
 app.secret_key = "supersecretkey"
@@ -949,163 +1068,21 @@ def get_prev_hour_range(run_dt):
 # Get actual query date/time range for the cron run
 query_date, start_time, end_time = get_prev_hour_range(now)
 
-############## Manual trigger Multiple dates range start ################
-# Define timezone
+############## Manual trigger START ################
+# from datetime import datetime
+# import pytz
+
+# # Define the IST timezone
 # local_tz = pytz.timezone('Asia/Kolkata')
 
-# # Get current IST time
+# # Get the current IST time
 # now = datetime.now(pytz.utc).astimezone(local_tz)
 
-# # Example: set custom date range
-# start_date = '2026-04-27'
-# end_date = '2026-05-01'
+# # Define the query date and time range
+# query_date = '2026-09-16'
 # start_time = '07:00:00'
-# end_time = '15:35:00'
-
-# # ------------------------------------------------------------------
-# # MongoDB: Fetch modelno and gt_code from production_db.channel_no_ufm
-# # ------------------------------------------------------------------
-
-# # MONGO_URI = "mongodb://<host>:<port>/"   # <-- replace with actual URI
-
-# # mongo_client = MongoClient(MONGO_URI)
-# mongo_db = client["production_db"]
-# channel_coll = mongo_db["channel_no_ufm"]
-
-# # -------- Fetch model numbers --------
-# modelno_list = channel_coll.distinct("modelno")
-
-# # modelno stored as string → convert to int
-# modelno_list = [int(m) for m in modelno_list if str(m).isdigit()]
-
-# if not modelno_list:
-#     raise ValueError("No model numbers found in MongoDB")
-
-# modelno_sql = ",".join(map(str, modelno_list))
-
-# print("Model numbers from MongoDB:", modelno_list)
-
-# # # -------- Fetch GT codes --------
-# # gt_code_nested = channel_coll.distinct("gt_code")
-
-# # # Flatten + deduplicate
-# # gt_code_list = sorted({gt for sub in gt_code_nested for gt in sub})
-
-# # if not gt_code_list:
-# #     raise ValueError("No GT codes found in MongoDB")
-
-# # gt_code_sql = ",".join(f"'{gt}'" for gt in gt_code_list)
-
-# # print("GT codes from MongoDB:", gt_code_list)
-
-# # -------- Fetch GT codes --------
-# gt_code_raw = channel_coll.distinct("gt_code")
-
-# gt_code_set = set()
-
-# for item in gt_code_raw:
-#     if isinstance(item, list):
-#         gt_code_set.update(item)
-#     elif isinstance(item, str):
-#         gt_code_set.add(item)
-
-# gt_code_list = sorted(gt_code_set)
-
-# gt_code_sql = ",".join(f"'{gt}'" for gt in gt_code_list)
-
-# print("GT codes from MongoDB:", gt_code_list)
-
-# # ------------------------------------------------------------------
-# # Query 1: ubtable (modelno filter from MongoDB)
-# # ------------------------------------------------------------------
-
-# q1 = f"""
-# SELECT *
-# FROM sc_tub_pcr.ubtable
-# WHERE ("date" > '{start_date}' 
-#        OR ("date" = '{start_date}' AND "time" >= '{start_time}'))
-# AND ("date" < '{end_date}' 
-#      OR ("date" = '{end_date}' AND "time" < '{end_time}'))
-# AND modelno IN ({modelno_sql});
-# """
-
-# print("######################### QUERY 1 #########################")
-# # print(q1)
-
-# df_tub = inst.execute_query(q1)
-# # df_tub.to_csv('df_tub.csv', escapechar='\\', quoting=csv.QUOTE_NONE,index=False)
-
-# # df_tub = pd.read_csv(f"df_tub.csv")
-
-# # ------------------------------------------------------------------
-# # Query 2: TBM + Curing + UFT + Repair (gt_code filter from MongoDB)
-# # ------------------------------------------------------------------
-
-# q2 = f"""
-# WITH barcode_data AS (
-#     SELECT barcode
-#     FROM sc_tub_pcr.ubtable
-#     WHERE ("date" > '{start_date}' 
-#            OR ("date" = '{start_date}' AND "time" >= '{start_time}'))
-#     AND ("date" < '{end_date}' 
-#          OR ("date" = '{end_date}' AND "time" < '{end_time}'))
-# ),
-# transport_units AS (
-#     SELECT 
-#         b.barcode, 
-#         t.transportationunitid
-#     FROM barcode_data b
-#     JOIN sc_cimcorp_pcr.transportationunit t 
-#       ON b.barcode = t.barcode
-#     ORDER BY b.barcode, t.transportationunitid
-# )
-# SELECT 
-#     tbm.timestamp AS timestamp_x,
-#     tbm.deviceid AS deviceid_x,
-#     tu.barcode,
-#     curing.timestamp AS timestamp_y,
-#     curing.deviceid AS deviceid_y,
-#     uft.result AS uftesting_result,
-#     tbm.*,
-#     curing.*,
-#     repair.operation AS operation
-# FROM sc_cimcorp_pcr.tbm tbm
-# JOIN transport_units tu 
-#   ON tbm.transportationunitid = tu.transportationunitid
-# JOIN sc_cimcorp_pcr.curing curing 
-#   ON tbm.transportationunitid = curing.transportationunitid
-# LEFT JOIN sc_cimcorp_pcr.uftesting uft 
-#   ON tbm.transportationunitid = uft.transportationunitid
-# LEFT JOIN sc_cimcorp_pcr.repair repair 
-#   ON tbm.transportationunitid = repair.transportationunitid
-# WHERE tbm.gttypeid IN ({gt_code_sql});
-# """
-
-# print("######################### QUERY 2 #########################")
-# # print(q2)
-
-# df_cimcorp = inst.execute_query(q2)
-
-# ############## Manual triggering end #################
-
-# query_date = '2026-04-16'
-# start_time = '07:00:00'
-# end_time = '19:00:00'
-
-
-# query_date = '2025-10-10'
-# start_time = '00:00:00'
-# end_time = '07:00:00'
-
-
-# ------------------------------------------------------------------
-# MongoDB: Fetch modelno and gt_code from production_db.channel_no_ufm
-
-
-# MONGO_URI = "mongodb://<host>:<port>/"   # <-- replace with actual URI
-
-# mongo_client = MongoClient(MONGO_URI)
-# ------------------------------------------------------------------
+# end_time = '10:00:00'
+############## Manual trigger END ################
 
 mongo_db = client["production_db"]
 channel_coll = mongo_db["channel_no_ufm"]
@@ -1324,7 +1301,7 @@ def clean_tub_data(df):
     df_clean.drop(columns=['rn', 'Unnamed: 226', 'Unnamed: 225'], inplace=True, errors='ignore')
 
     df_clean.columns = df_clean.columns.to_series().str.strip().str.lower().str.replace(' ', '_')
-    df_clean = df_clean.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df_clean = df_clean.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     # Remove trailing zeros and decimal point from 'barcode' and 'modelno'
     # if 'barcode' in df_clean.columns:
@@ -1529,9 +1506,9 @@ def clean_cimcorp_data(df):
     logging.info("clean_cimcorp_data function is just started")
 
     try:
-        df = df.applymap(str)
+        df = df.map(str)
         df.columns = [re.sub(r'[.\s]+', '_', col.strip()).lower() for col in df.columns]
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
 
         for col in df.select_dtypes(include=['object']):
             df[col] = df[col].astype(str).str.strip()
@@ -1942,6 +1919,11 @@ def remove_duplicates_collection(collection):
 #     return output_messages, cleaned_collection_name, invalid_collection_name
 
 def process_data_for_api(db_client, source_data, database_name, filename):
+    # Sanitize record dicts so NaT / NaN / numpy types are safe for MongoDB BSON
+    # (these can re-emerge when pandas reconstructs a DataFrame from None values)
+    def _sanitize_records(records):
+        return [{k: _to_native(v) for k, v in rec.items()} for rec in records]
+
     output_messages = []
     cleaned_collection_name = None
     invalid_collection_name = None
@@ -1957,7 +1939,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             if not invalid_df.empty:
                 invalid_df = invalid_df.drop('_id', axis=1, errors='ignore')
                 invalid_collect = db_client[INVALID_ROWS_DB][invalid_collection_name]
-                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(invalid_df.to_dict("records"))
+                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(_sanitize_records(invalid_df.to_dict("records")))
                 output_messages.append(f"Invalid TUB data saved to invalid_data_TUB.{invalid_collection_name}")
             else:
                 output_messages.append("No invalid TUB data to save.")
@@ -1972,7 +1954,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
                 delete_result = combined_tub_collection.delete_many({})
                 output_messages.append(f"Deleted {delete_result.deleted_count} existing documents from {COMBINED_Database}.{ALL_COMBINED_TUB_COLLECTION}")
                 
-                combined_tub_collection.insert_many(cleaned_df.to_dict("records"))
+                combined_tub_collection.insert_many(_sanitize_records(cleaned_df.to_dict("records")))
                 output_messages.append(f"Cleaned TUB data pushed to {COMBINED_Database}.{ALL_COMBINED_TUB_COLLECTION}")
             else:
                 output_messages.append("No cleaned TUB data to push to combined collection")
@@ -1985,7 +1967,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             
             if not invalid_barcode_rows.empty:
                 invalid_barcode_rows = invalid_barcode_rows.drop('_id', axis=1, errors='ignore')
-                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(invalid_barcode_rows.to_dict("records"))
+                db_client[INVALID_ROWS_DB][invalid_collection_name].insert_many(_sanitize_records(invalid_barcode_rows.to_dict("records")))
                 output_messages.append(f"Invalid CIMCORP data saved to invalid_data_CIMCORP.{invalid_collection_name}")
             else:
                 output_messages.append("No invalid barcode CIMCORP data to save.")
@@ -1993,7 +1975,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
             if not duplicates_df.empty:
                 duplicate_collection_name = f"duplicate_CIMCORP_{filename.replace('.csv', '').replace('.xlsx', '')}"
                 duplicates_df = duplicates_df.drop('_id', axis=1, errors='ignore')
-                db_client[INVALID_ROWS_DB][duplicate_collection_name].insert_many(duplicates_df.to_dict("records"))
+                db_client[INVALID_ROWS_DB][duplicate_collection_name].insert_many(_sanitize_records(duplicates_df.to_dict("records")))
                 output_messages.append(f"Duplicate CIMCORP data saved to {INVALID_ROWS_DB}.{duplicate_collection_name}")
             else:
                 output_messages.append("No duplicate CIMCORP data to save.")
@@ -2008,7 +1990,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
                 delete_result = combined_cimcorp_collection.delete_many({})
                 output_messages.append(f"Deleted {delete_result.deleted_count} existing documents from {COMBINED_Database}.{ALL_COMBINED_CIMCORP_COLLECTION}")
                 
-                combined_cimcorp_collection.insert_many(cleaned_df.to_dict("records"))
+                combined_cimcorp_collection.insert_many(_sanitize_records(cleaned_df.to_dict("records")))
                 output_messages.append(f"Cleaned CIMCORP data pushed to {COMBINED_Database}.{ALL_COMBINED_CIMCORP_COLLECTION}")
             else:
                 output_messages.append("No cleaned CIMCORP data to push to combined collection")
@@ -2019,6 +2001,7 @@ def process_data_for_api(db_client, source_data, database_name, filename):
     except Exception as e:
         error_message = f"Error processing data: {e}"
         output_messages.append(error_message)
+        logging.error("process_data_for_api error: %s", e, exc_info=True)
         return output_messages, None, None
     
     logging.info("process_data_for_api function is completed")
@@ -2444,7 +2427,7 @@ def deduplicate_target_collection_api(target_db, target_collection_name):
             output_messages.append(f"⚠️ Target collection {target_collection_name} is empty. No duplicates to remove.")
             return output_messages
 
-        existing_df = existing_df.applymap(make_hashable)
+        existing_df = existing_df.map(make_hashable)
         existing_df.drop_duplicates(inplace=True)
         output_messages.append(f"Target collection after dropping duplicates: {len(existing_df)} documents")
 
@@ -12844,7 +12827,7 @@ def main():
         return {
             "status": "success",
             "message": "All processes completed successfully.",
-            "output_log": output_messages,
+            # "output_log": output_messages,
             # "tbm_lot_alert_results": tbm_lot_alert_results
             # "curing_lot_alert_results": curing_lot_alert_results
         }
